@@ -5,9 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Roast Room · AI Automation Society</title>
   <link rel="icon" href="/brand/favicon-ais.png" type="image/png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -26,12 +23,17 @@
       <li data-step="verdict">Verdict</li>
     </ol>
     <div class="top-actions">
-      <span class="usage" id="usage" title="Tokens used by this app since it started"></span>
       <button class="ghost" id="guideBtn" type="button">How it works</button>
       <button class="ghost" id="historyBtn" type="button">Past sessions</button>
+      <button class="ghost stop-run" id="cancelBtn" type="button" hidden>Cancel council</button>
       <button class="ghost" id="newBtn" type="button" hidden>New question</button>
     </div>
   </header>
+
+  <div class="connection-notice" id="connectionNotice">
+    <p id="connectionMessage" role="status">Connecting to the room…</p>
+    <button class="ghost" id="reconnectBtn" type="button" hidden>Retry connection</button>
+  </div>
 
   <div class="topic" id="topic" hidden>
     <div class="topic-main">
@@ -55,23 +57,16 @@
           <div class="waiting" id="waiting" hidden>
             <span class="pulse"><i></i>The room is open</span>
             <h2 data-type>Bring a decision to the Roast Room</h2>
-            <p>In Claude Code, type the line below with your decision. The council shows up here and argues it out live.</p>
-            <code>/roast-room should I ...</code>
+            <p>In Codex, use the room’s skill with your decision. Watch the council here as each round finishes.</p>
+            <code>$roast-room should I ...</code>
             <div class="row"><button class="ghost" type="button" id="waitGuide">What to put in your question</button><button class="ghost" type="button" id="waitHistory">Watch a past council</button></div>
           </div>
 
-          <form class="composer" id="composer" hidden>
-            <h2 data-type>What decision do you need help with?</h2>
-            <textarea id="prompt" rows="3" placeholder="Give them the decision, your options, a few numbers (revenue, cash, team), and which way you're leaning." required minlength="10"></textarea>
-            <div class="samples" id="samples"></div>
-            <div class="composer-row">
-              <div class="mode" role="radiogroup" aria-label="Council size">
-                <label><input type="radio" name="mode" value="full" checked><span>Full council <small>7 seats, 3 rounds</small></span></label>
-                <label><input type="radio" name="mode" value="quick"><span>Quick <small>4 seats, 2 rounds</small></span></label>
-              </div>
-              <button class="convene" type="submit" id="convene">Convene the council</button>
-            </div>
-          </form>
+          <div class="waiting" id="invite" hidden>
+            <h2>Bring a decision to the table</h2>
+            <p>The Chair weighs your options with a board of Codex advisors.</p>
+            <button class="ghost" type="button" id="focusIntake">Write your question</button>
+          </div>
 
           <div class="caption" id="caption" hidden>
             <div class="cap-head">
@@ -89,7 +84,7 @@
             <p class="wc-sub" id="wcSub"></p>
             <p class="wc-muse" id="wcMuse"></p>
             <div class="wc-bar"><i id="wcBar"></i></div>
-            <p class="wc-nudge" id="wcNudge" hidden>Nothing new for a while? Check Claude Code. It may be waiting for you to answer or approve something.</p>
+            <p class="wc-nudge" id="wcNudge" hidden>Still working. Completed rounds will appear here together.</p>
           </div>
 
           <div class="cruxes" id="cruxes" hidden></div>
@@ -108,36 +103,65 @@
       </div>
     </section>
 
-    <aside class="panel" aria-label="Key points">
+    <aside class="panel" aria-label="Council details">
       <div class="panel-head" id="panelHead">Key points</div>
+      <form class="composer tabpanel" id="composer" hidden>
+        <h2>What are you deciding?</h2>
+        <label for="idea">Decision</label>
+        <textarea id="idea" rows="3" maxlength="4000" placeholder="Should I build the full product or sell a smaller pilot first?" required minlength="10"></textarea>
+        <div class="samples" id="samples" aria-label="Example decisions"></div>
+        <label for="context">Context <small>Optional</small></label>
+        <textarea id="context" rows="3" maxlength="8000" placeholder="Options, budget, constraints and what success looks like"></textarea>
+        <fieldset class="mode">
+          <legend>Council mode</legend>
+          <label><input type="radio" name="mode" value="full" checked><span>Full council <small>5–7 by default</small></span></label>
+          <label><input type="radio" name="mode" value="quick"><span>Quick <small>4 advisors</small></span></label>
+        </fieldset>
+        <details class="seat-picker">
+          <summary>Choose advisors <small>Optional</small></summary>
+          <p class="muted" id="seatHelp"></p>
+          <div id="seatChoices" class="seat-choices" role="group" aria-label="Advisors" aria-describedby="seatHelp"></div>
+        </details>
+        <p id="submitError" class="field-error" role="alert" hidden></p>
+        <button class="convene" type="submit" id="convene">Convene the council</button>
+      </form>
+      <form class="clarification tabpanel" id="clarification" hidden>
+        <h2>The Chair has a question</h2>
+        <ul id="questions"></ul>
+        <label for="answer">Your answer</label>
+        <textarea id="answer" rows="4" maxlength="8000" placeholder="Answer what you know."></textarea>
+        <p id="clarificationError" class="field-error" role="alert" hidden></p>
+        <button class="convene" type="submit" id="answerBtn">Send to the Chair</button>
+      </form>
+      <div class="run-status" id="runStatus" role="status" hidden></div>
       <div class="tabpanel" id="feed">
         <div class="empty">One line per seat as the council talks. Click a seat to read its full card.</div>
       </div>
     </aside>
   </main>
 
-  <div class="sheet" id="verdictSheet" hidden>
+  <dialog class="sheet" id="verdictSheet" aria-labelledby="verdictHeading">
     <div class="sheet-inner" id="verdictBody"></div>
-  </div>
+  </dialog>
 
-  <dialog id="cardDialog" class="card-dialog">
+  <dialog id="cardDialog" class="card-dialog" aria-labelledby="seatHeading">
     <div id="cardBody"></div>
     <form method="dialog"><button class="ghost">Close</button></form>
   </dialog>
 
-  <dialog id="guideDialog" class="card-dialog">
+  <dialog id="guideDialog" class="card-dialog" aria-labelledby="guideHeading">
     <div id="guideBody"></div>
     <form method="dialog"><button class="ghost">Close</button></form>
   </dialog>
 
-  <dialog id="historyDialog" class="card-dialog">
-    <h3>Past sessions</h3>
+  <dialog id="historyDialog" class="card-dialog" aria-labelledby="historyHeading">
+    <h3 id="historyHeading">Past sessions</h3>
     <p class="muted">Replay a council exactly as it happened.</p>
     <ul class="history" id="historyList"></ul>
     <form method="dialog"><button class="ghost">Close</button></form>
   </dialog>
 
-  <div class="toast" id="toast" hidden></div>
+  <div class="toast" id="toast" role="status" hidden></div>
   <p class="disclaimer">Simulated advisors built from each person's public work and drawn as caricatures. They are not the people and do not speak for them.</p>
 
   <script src="/app.js" type="module"></script>
