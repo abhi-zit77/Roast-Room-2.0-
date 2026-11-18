@@ -157,7 +157,7 @@ export function finalizeDecision({ setup, rounds, plan, votedDraft = null, cruxe
     return { seat: card.seat, score: pillarScore, repair: pillarScore <= 4 ? repair : "" };
   });
   return {
-    schemaVersion: 1, protocolVersion: 1, scoringVersion: SCORE_VERSION, promptVersion: 1,
+    schemaVersion: 1, protocolVersion: 1, scoringVersion: SCORE_VERSION, promptVersion: 2,
     title: setup.title, mode: setup.mode, setup, brief, rounds, roundsCompleted: rounds.length, cruxes, evidence, profiles,
     plan: currentPlan, draftHash: hash, votedDraft, recommended, optionLabel: option.label, label, scoreBand: BANDS[band], scores,
     denominator, spread, confidence, support, votes, ratificationStatus, overrides, pillars,

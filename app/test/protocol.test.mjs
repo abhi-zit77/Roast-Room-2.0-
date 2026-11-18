@@ -245,6 +245,38 @@ test("malformed Codex output receives one repair before opening publication", as
   assert.equal(d.rounds[0].cards.length, 4);
 });
 
+test("rebuttals can target a sourced opening without inheriting another seat's passage IDs", async () => {
+  const id = "bezos:private-packet-passage";
+  const h = harness({
+    getEvidence: ({ seat }) => ({ status: "framework_only", gaps: [], passages: seat.key === "bezos" ? [{ id }] : [] }),
+    onCard(card, { key, round }) {
+      if (key === "bezos" && round === 1) Object.assign(card.claims[0], { kind: "source_summary", evidenceIds: [id] });
+      return card;
+    },
+  });
+  const decision = await h.run();
+  const rebuttal = h.calls.find(({ stage, payload }) => stage === "rebuttal" && payload.seat.key === "buffett");
+  const target = rebuttal.payload.openings.find(({ seat }) => seat === "bezos").claims[0];
+  assert.equal(target.id, "bezos:r1:claim-1");
+  assert.equal(target.statement, "Double-check scope with bezos.");
+  assert.ok(!rebuttal.prompt.includes(id), "an opponent's passage ID is outside this seat's packet");
+  assert.match(rebuttal.prompt, /evidenceIds and counterevidenceIds empty/i);
+  assert.deepEqual(decision.rounds[0].cards[0].card.claims[0].evidenceIds, [id]);
+});
+
+test("repair guidance identifies when a framework-only claim was mislabelled as a source summary", async () => {
+  let attempts = 0;
+  const h = harness({ onCard(card, { key, round }) {
+    if (key === "buffett" && round === 2) card.claims[0].kind = ++attempts === 1 ? "source_summary" : "framework_application";
+    return card;
+  } });
+  const decision = await h.run();
+  const prompts = h.calls.filter(({ stage, payload }) => stage === "rebuttal" && payload.seat.key === "buffett");
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1].prompt, /The source_summary claim needs a supporting passage ID/i);
+  assert.equal(decision.rounds[1].cards.find(({ seat }) => seat === "buffett").card.claims[0].kind, "framework_application");
+});
+
 test("quote repair replaces a wrong speaker's caption with a verified advisor passage", async () => {
   const text = "A real buyer is a better signal than a busy demo.";
   const passages = [

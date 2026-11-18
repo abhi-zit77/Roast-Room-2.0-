@@ -110,11 +110,15 @@ export async function validateCard(value, { round, seat, options, evidence, prio
   check(value.assessments.every(({ score }) => score <= assessmentOf(value, value.preferredOption).score),
     "The preferred option must earn one of your highest scores.");
   const passageIds = new Set(evidence.passages.map(({ id }) => id));
-  check(value.claims.length >= 1 && value.claims.length <= 4 && value.claims.every((entry) => ids.includes(entry.option) &&
-    populated(entry.statement) && populated(entry.whatWouldChange) &&
-    (entry.kind !== "source_summary" || entry.evidenceIds.length > 0) &&
-    [...entry.evidenceIds, ...entry.counterevidenceIds].every((id) => passageIds.has(id))),
-  "Give one to four claims with a condition that would change each judgment. Cite only passage IDs from the supplied packet.");
+  check(value.claims.length >= 1 && value.claims.length <= 4, "Give one to four claims.");
+  for (const entry of value.claims) {
+    check(ids.includes(entry.option), "Use an exact option ID from brief.options on each claim.");
+    check(populated(entry.statement) && populated(entry.whatWouldChange), "Give each claim a statement and a specific whatWouldChange condition.");
+    check(entry.kind !== "source_summary" || entry.evidenceIds.length > 0,
+      "The source_summary claim needs a supporting passage ID from your own evidence packet. Use framework_application or inference for reasoning without a passage.");
+    check([...entry.evidenceIds, ...entry.counterevidenceIds].every((id) => passageIds.has(id)),
+      "Cite only passage IDs in your own evidence packet. Keep evidenceIds and counterevidenceIds empty when your packet has no passages.");
+  }
   const prose = [value.headline, ...value.frameworksUsed, ...value.claims.flatMap(({ statement, whatWouldChange }) => [statement, whatWouldChange]),
     ...value.assessments.flatMap(({ risk, repair }) => [risk, repair])];
   check(value.quotes.length <= 3, "Use at most three attributed quotes.");
