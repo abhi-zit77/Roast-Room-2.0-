@@ -1,6 +1,8 @@
-// The Roast Room verdict as a one or two page branded PDF, built in the browser with a
+// The Roast Room verdict as a branded PDF, built in the browser with a
 // vendored jsPDF, so the room still needs nothing installed. White page, Montserrat,
 // AIS Dark Blue type, AIS Blue as the accent only (AIS Brand Guidelines v1).
+
+import { buildDecisionReport, sourceDetails } from "./decision-report.js";
 
 const C = {
   ink: [7, 18, 28], soft: [55, 68, 82], mute: [112, 124, 138], rule: [226, 231, 237],
@@ -226,6 +228,137 @@ export async function downloadVerdictPdf({ setup, verdict: ev, byKey, id }) {
   }
 
   const name = `Roast Room - ${String(setup.title || id || "verdict").replace(/[\\/:*?"<>|]+/g, "").slice(0, 80)}.pdf`;
+  doc.save(name);
+  return name;
+}
+
+export async function downloadDecisionPdf({ decision }) {
+  await loadLib();
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: "pt", format: "letter", compress: true });
+  await addFonts(doc);
+  const logo = "data:image/png;base64," + (await fetchBase64("/brand/ais-horizontal-on-light.png"));
+  const report = buildDecisionReport(decision);
+  const margin = 54;
+  const width = 612 - margin * 2;
+  const bottom = 723;
+  let y = margin;
+
+  const font = (size, style, color) => {
+    doc.setFont("Montserrat", style);
+    doc.setFontSize(size);
+    doc.setTextColor(...color);
+  };
+  const space = (height) => {
+    if (y + height > bottom) {
+      doc.addPage();
+      y = margin;
+    }
+  };
+  const write = (value, { size = 10, style = "normal", color = C.ink, gap = 4 } = {}) => {
+    if (!value) return;
+    font(size, style, color);
+    const lines = doc.splitTextToSize(String(value), width);
+    for (const line of lines) {
+      space(size * 1.4);
+      doc.text(line, margin, y + size);
+      y += size * 1.4;
+    }
+    y += gap;
+  };
+  const heading = (value, reserved = 65) => {
+    space(reserved);
+    y += 12;
+    doc.setDrawColor(...C.rule);
+    doc.line(margin, y, margin + width, y);
+    y += 9;
+    write(value, { size: 13, style: "bold" });
+  };
+  const items = (values) => values.forEach((value) => write(`•  ${value}`));
+  const keyed = (label, value) => { if (value) write(`${label} · ${value}`, { color: C.soft }); };
+  const section = (label, values) => { if (values.length) { heading(label); items(values); } };
+
+  doc.addImage(logo, "PNG", margin, y, 62, 62 * 374 / 900, "ais-logo", "SLOW");
+  font(10, "semibold", C.mute);
+  doc.text(`Roast Room · ${dateLine(decision.id)}`, margin + width, y + 16, { align: "right" });
+  y += 37;
+  write(report.title, { size: 21, style: "bold", gap: 9 });
+  write(report.label, { size: 14, style: "bold" });
+  write(`Recommended option ${report.recommended} · ${report.optionLabel}`, { size: 13, style: "semibold" });
+  write(report.recommendation, { size: 11 });
+  write(`${report.ratification} · Score band ${report.scoreBand} · Confidence ${report.confidence}/10 · Spread ${report.spread}`, { color: C.soft });
+  if (report.support != null) keyed("Support for the voted draft", `${report.support}/10`);
+
+  heading(report.dissent?.caveat ? "Strongest caveat" : "Strongest dissent");
+  if (report.dissent) {
+    write(report.dissent.name, { style: "semibold" });
+    write(report.dissent.statement);
+    keyed("What would change the assessment", report.dissent.whatWouldChange);
+  } else {
+    write("The council recorded no unresolved dissent.");
+  }
+  if (report.cheapestTest) {
+    heading("Cheapest experiment");
+    write(report.cheapestTest.action, { style: "semibold" });
+    keyed("Cost", report.cheapestTest.cost);
+    keyed("Success threshold", report.cheapestTest.success);
+    if (report.cheapTestRequired) write("Required before proceeding.", { style: "semibold" });
+  }
+
+  heading("Weighted option scores", 95);
+  for (const option of report.scores) {
+    space(42);
+    write(`${option.id} · ${option.label} · ${option.display}/10${option.recommended ? " · Recommended" : ""}`, { style: "semibold" });
+    write(option.math, { size: 9, color: C.soft });
+  }
+  section("Verdict conditions", [...report.overrides.map(({ message }) => message), ...report.conditions,
+    ...report.mitigations.map(({ option, description }) => `Option ${option} · ${description}`),
+    ...(report.prerequisite ? [`${report.prerequisite.trigger} · Due ${report.prerequisite.deadline} · If unmet, ${report.prerequisite.failure}`] : [])]);
+  section("Reasons and disagreements", [...report.reasons.map(({ name, point }) => [name, point].filter(Boolean).join(" · ")),
+    ...report.cruxes.map(({ question }) => question)]);
+  section("Actions and review", [...report.actions.map(({ when, action }) => [when, action].filter(Boolean).join(" · ")),
+    ...report.pillars.filter(({ repair }) => repair).map(({ name, score, repair }) => `${name} · Pillar ${score}/10 · ${repair}`),
+    ...report.stopConditions.map((condition) => `Stop if ${condition}`), ...(report.reviewDate ? [`Review · ${report.reviewDate}`] : [])]);
+  section("Advisor scorecard", report.scorecard.map((row) => [row.name, `Weight ${row.weight}`,
+    ...report.scores.map(({ id }, index) => `${id} ${row.scores[index]}/10`), row.vote].filter(Boolean).join(" · ")));
+  section("Draft record", [report.draftHash && `Plan ${report.draftHash}`,
+    report.votedHash && `Voted draft ${report.votedHash}`].filter(Boolean));
+
+  if (report.evidence.length) {
+    doc.addPage();
+    y = margin;
+    write("Evidence appendix", { size: 18, style: "bold" });
+    for (const evidence of report.evidence) {
+      heading(evidence.name, 80);
+      write(evidence.status, { color: C.soft });
+      if (evidence.version) keyed("Advisor knowledge", evidence.version);
+      if (evidence.frameworks.length) keyed("Frameworks applied", evidence.frameworks.join(", "));
+      for (const gap of evidence.gaps) write(gap, { size: 9, color: C.soft });
+      for (const source of evidence.passages) {
+        space(55);
+        write(source.title, { style: "semibold" });
+        write(sourceDetails(source), { size: 9, color: C.soft });
+        for (const quote of source.directQuotes) keyed("Direct quotation", `“${quote}”`);
+        if (source.url) {
+          space(20);
+          font(9, "semibold", C.ink);
+          doc.textWithLink(`Watch at ${source.time}`, margin, y + 9, { url: source.url });
+          y += 17;
+        }
+      }
+    }
+  }
+
+  const total = doc.getNumberOfPages();
+  for (let p = 1; p <= total; p++) {
+    doc.setPage(p);
+    doc.setDrawColor(...C.rule);
+    doc.line(margin, 746, margin + width, 746);
+    font(8, "normal", C.mute);
+    doc.text("Codex council · Simulated advisors", margin, 762);
+    doc.text(`${p} of ${total}`, margin + width, 762, { align: "right" });
+  }
+  const name = `Roast Room - ${String(report.title || decision.id || "verdict").replace(/[\\/:*?"<>|]+/g, "").slice(0, 80)}.pdf`;
   doc.save(name);
   return name;
 }

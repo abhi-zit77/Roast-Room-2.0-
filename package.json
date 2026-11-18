@@ -1,12 +1,26 @@
 {
-  "name": "roast-room",
-  "version": "1.0.0",
+  "name": "roast-room-codex",
+  "version": "2.0.0",
   "private": true,
-  "description": "The Roast Room: eleven AI advisors built from the public work of Bezos, Paul Graham, Hormozi, Gary Vaynerchuk, Dan Martell, Gino Wickman, Buffett, Naval Ravikant, Codie Sanchez, Leila Hormozi, and Sara Blakely (plus any you add with /newroaster) debate your decision in Claude Code, live around a table.",
+  "description": "A local Codex decision council with evidence, weighted scoring and replay.",
   "type": "module",
   "scripts": {
     "start": "node app/server.mjs",
-    "smoke": "node app/scripts/smoke.mjs"
+    "room": "node app/roast-room.mjs",
+    "demo": "node app/roast-room.mjs demo",
+    "smoke": "node app/scripts/browser-smoke.mjs",
+    "test": "node --test app/test/*.test.mjs",
+    "lint": "eslint app --max-warnings=0",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "eslint": "10.15.0",
+    "globals": "17.14.0",
+    "playwright": "1.65.1",
+    "typescript": "5.9.3"
+  }
 }

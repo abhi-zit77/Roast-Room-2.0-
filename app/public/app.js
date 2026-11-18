@@ -1,8 +1,8 @@
-import { downloadVerdictPdf } from "./pdf.js";
+import { downloadDecisionPdf, downloadVerdictPdf } from "./pdf.js";
+import { buildDecisionReport, buildSeatEvidence, escapeHtml as esc, evidenceReferences, renderSeatSources } from "./decision-report.js";
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 const SAMPLES = [
   ["Raise my prices?", "I run a coaching business doing $30k a month with 15 active clients at $2,000 each. I want to raise the price to $3,500. Options: raise for everyone now, raise for new clients only, or keep $2,000. Close rate is about 50% on sales calls. I'm leaning toward raising for everyone because I'm underpaid."],
@@ -19,10 +19,9 @@ const GUIDE = `
     <div class="guide-sec">
       <h4>How to use the Roast Room</h4>
       <ol>
-        <li><span>Open Claude Code in this folder.</span></li>
-        <li><span>Type <code>/roast-room</code> and your decision.</span></li>
-        <li><span>Pick your advisors (the Chair recommends a board) and answer its questions. Then watch the council argue it out here.</span></li>
-        <li><span>When the verdict lands, download it as a PDF.</span></li>
+        <li><span>Submit a decision in the room or type <code>$roast-room</code> in Codex from this folder.</span></li>
+        <li><span>Let the Chair pick the advisors, or choose a board. Answer any questions that come up before the opening round.</span></li>
+        <li><span>Watch the rounds and download the verdict as Markdown or PDF.</span></li>
       </ol>
     </div>
     <div class="guide-sec">
@@ -40,18 +39,17 @@ const GUIDE = `
     <div class="guide-sec">
       <h4>Example</h4>
       <div class="example">
-        <p><code>/roast-room</code> ${EXAMPLE.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</p>
+        <p><code>$roast-room</code> ${esc(EXAMPLE)}</p>
         <button class="ghost" type="button" data-copy-example>Copy this example</button>
       </div>
     </div>
     <div class="guide-sec">
       <h4>Good to know</h4>
       <ul>
-        <li><span><b>Pick your council:</b> the Chair recommends the advisors that fit your question and asks you to confirm. Add or drop anyone.</span></li>
-        <li><span><b>Full council:</b> 5 to 7 advisors, 3 rounds. For big calls that are hard to undo.</span></li>
-        <li><span><b>Quick:</b> add <code>--quick</code> for 4 advisors and 2 rounds. Uses far less of your plan.</span></li>
+        <li><span><b>Full council:</b> The Chair selects five to seven advisors by default. They go through openings, debate and a vote.</span></li>
+        <li><span><b>Quick:</b> Four advisors hold openings and debate. Close agreement can skip the vote.</span></li>
         <li><span><b>Every council is saved.</b> Open Past sessions to replay one or download its PDF.</span></li>
-        <li><span><b>Add an advisor:</b> type <code>/newroaster</code> and a name. Change your default board with <code>/roast-room board</code>.</span></li>
+        <li><span><b>Read the sources:</b> Advisor cards show transcript passages, speaker checks, source gaps and stored frameworks.</span></li>
       </ul>
     </div>
   </div>`;
@@ -95,32 +93,61 @@ const ROUND_NAME = ["", "Opening", "Debate", "Vote"];
 const state = {
   seats: [], byKey: {}, board: [], table: [], session: null, options: [], weights: {}, active: [], round: 0,
   cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], geo: {}, setup: null, wait: null,
+  runner: null, decision: null, terminal: false, control: false, submitting: false,
 };
 
 // ------------------------------------------------------------- boot
 async function boot() {
-  const r = await refreshSeats();
-  state.runner = r.runner;
-  if (r.runner === "api" && !r.hasKey) toast("No ANTHROPIC_API_KEY found in .env. Add it and restart the server.");
-  renderSeats(state.board);
   renderSamples();
   bindUI();
   new ResizeObserver(() => { layoutStage(); drawLinks(); }).observe($("#stage"));
-  startBlinking();
-  reset();
-  typeIn($("#composer h2"));
   typeIn($("#waiting h2"));
-  const ss = await fetch("/api/sessions").then((x) => x.json());
-  if (ss.running) attach(ss.running);
-  else if (ss.live) attach(ss.live);
-  refreshUsage();
+  await connectRoom();
   setInterval(watchForLive, 2500);
   setInterval(tickWait, 1000);
 }
 
+async function requestJson(url, value) {
+  const response = await fetch(url, value === undefined ? undefined : {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(value),
+  });
+  if (!response.ok) {
+    const issue = await response.json().catch(() => ({}));
+    throw new Error(issue.error || "The room couldn’t complete this request.");
+  }
+  return response.json();
+}
+
+function connectionNotice(message = "", retry = false) {
+  $("#connectionMessage").textContent = message;
+  $("#reconnectBtn").hidden = !retry;
+  $("#connectionNotice").hidden = !message;
+}
+
+async function connectRoom() {
+  connectionNotice("Connecting to the room…");
+  const requested = new URL(location.href).searchParams.get("session");
+  try {
+    const [roster, listing] = await Promise.all([refreshSeats(), requestJson("/api/sessions")]);
+    state.runner = roster.runner;
+    renderSeatChoices();
+    reset();
+    connectionNotice();
+    const entry = listing.sessions.find((session) => session.id === requested);
+    if (requested && entry?.status !== "running" && requested !== listing.running && requested !== listing.live) await replay(requested);
+    else if (requested || listing.running || listing.live) {
+      attach(requested || listing.running || listing.live, { control: Boolean(requested ? requested === listing.running : listing.running) });
+    }
+  } catch {
+    connectionNotice("The room couldn’t connect. Check that the local server is running.", true);
+  }
+}
+
 // The roster (every seat, plus the default board) comes from the skill's roster.json.
 async function refreshSeats() {
-  const r = await fetch("/api/seats").then((x) => x.json());
+  const r = await requestJson("/api/seats");
   state.seats = r.seats;
   state.byKey = Object.fromEntries(r.seats.map((s) => [s.key, s]));
   state.board = (r.board?.default || []).filter((k) => state.byKey[k]);
@@ -129,14 +156,15 @@ async function refreshSeats() {
   return r;
 }
 
-// a council started in Claude Code shows up here on its own
+// A CLI council opens automatically when the room has no session loaded.
 const seenLive = new Set();
 async function watchForLive() {
-  const ss = await fetch("/api/sessions").then((x) => x.json()).catch(() => null);
-  const id = ss?.live || ss?.running;
-  if (!id || seenLive.has(id) || id === state.session) return;
-  seenLive.add(id);
-  attach(id);
+  if (!state.runner || state.session || state.submitting) return;
+  const ss = await requestJson("/api/sessions").catch(() => null);
+  if (state.session || state.submitting) return;
+  const id = ss?.running || ss?.live;
+  if (!id || seenLive.has(id)) return;
+  attach(id, { control: id === ss.running });
 }
 
 // AIS arrival: a heading types in a character at a time, blur to sharp
@@ -154,9 +182,22 @@ function renderSamples() {
   $("#samples").innerHTML = SAMPLES.map(([t], i) => `<button type="button" data-i="${i}">${esc(t)}</button>`).join("");
   $("#samples").addEventListener("click", (e) => {
     const b = e.target.closest("button"); if (!b) return;
-    $("#prompt").value = SAMPLES[b.dataset.i][1];
-    $("#prompt").focus();
+    $("#idea").value = SAMPLES[b.dataset.i][1];
+    $("#idea").focus();
   });
+}
+
+function renderSeatChoices() {
+  $("#seatChoices").innerHTML = state.seats.map((seat) =>
+    `<label><input type="checkbox" name="seat" value="${esc(seat.key)}"> ${esc(seat.name)}</label>`).join("");
+  updateSeatHelp();
+}
+
+function updateSeatHelp() {
+  const mode = $('input[name="mode"]:checked').value;
+  const count = $$('#seatChoices input:checked').length;
+  const hint = mode === "quick" ? "Choose any four." : "Choose two to nine advisors.";
+  $("#seatHelp").textContent = count ? `${count} selected. ${hint}` : `${hint} Leave them blank for the Chair to pick.`;
 }
 
 const MAX_TABLE = 9; // the most busts the table can seat and still read
@@ -219,7 +260,7 @@ function layoutStage() {
     stage.style.paddingTop = "";
     // the captions start below the lowest nameplate they could collide with
     const inner = (n > 2 ? state.table.slice(1, -1) : state.table).map((k) => $(`#plate-${k}`));
-    const top = Math.max(...inner.map((p) => p.offsetTop + p.offsetHeight / 2)) + H * 0.035;
+    const top = Math.max(H * .48, ...inner.map((p) => p.offsetTop + p.offsetHeight / 2)) + H * 0.035;
     Object.assign(c.style, { left: `${W * 0.2}px`, width: `${W * 0.6}px`, top: `${top}px`, height: `${H - top - H * 0.09}px` });
   }
   const sp = state.speaking ? state.geo[state.speaking] : null;
@@ -238,15 +279,70 @@ function moveSpot(key) {
 function bindUI() {
   $("#composer").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const prompt = $("#prompt").value.trim();
-    if (prompt.length < 10) return toast("Give the council a real decision, at least a sentence.");
+    if (state.submitting) return;
+    const idea = $("#idea").value.trim();
+    const context = $("#context").value.trim();
     const mode = $('input[name="mode"]:checked').value;
-    $("#convene").disabled = true;
-    const r = await fetch("/api/council", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ prompt, mode }) });
-    const j = await r.json();
-    $("#convene").disabled = false;
-    if (!r.ok) return toast(j.error || "Could not start the council.");
-    attach(j.id);
+    const seats = $$('#seatChoices input:checked').map((input) => input.value);
+    fieldError("#submitError");
+    if (idea.length < 10) {
+      fieldError("#submitError", "Enter the decision as a sentence.");
+      return $("#idea").focus();
+    }
+    if (seats.length && (mode === "quick" ? seats.length !== 4 : seats.length < 2 || seats.length > 9)) {
+      fieldError("#submitError", mode === "quick" ? "Choose exactly four advisors for quick mode." : "Choose two to nine advisors for full mode.");
+      const picker = $(".seat-picker");
+      picker.open = true;
+      return $("summary", picker).focus();
+    }
+    const button = $("#convene");
+    state.submitting = button.disabled = true;
+    button.textContent = "Starting the council…";
+    try {
+      const session = await requestJson("/api/council", { idea, context, mode, ...(seats.length ? { seats } : {}) });
+      attach(session.id, { control: true });
+    } catch (error) {
+      fieldError("#submitError", error.message);
+    } finally {
+      state.submitting = button.disabled = false;
+      button.textContent = "Convene the council";
+    }
+  });
+  $("#composer").addEventListener("change", updateSeatHelp);
+  $("#focusIntake").addEventListener("click", () => $("#idea").focus());
+  $("#clarification").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = state.session;
+    const button = $("#answerBtn");
+    if (!state.control || !id || button.disabled) return;
+    fieldError("#clarificationError");
+    button.disabled = true;
+    try {
+      await requestJson(sessionAction(id, "clarification"), { answer: $("#answer").value.trim() });
+      if (state.session === id) closeClarification();
+    } catch (error) {
+      if (state.session === id) fieldError("#clarificationError", error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $("#cancelBtn").addEventListener("click", async (e) => {
+    const id = state.session;
+    const button = e.currentTarget;
+    if (!id || !state.control || button.disabled) return;
+    button.disabled = true;
+    try {
+      await requestJson(sessionAction(id, "cancel"), {});
+      if (state.session === id && !state.terminal) showRunStatus("Cancelling the council…");
+    } catch (error) {
+      if (state.session === id) toast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $("#reconnectBtn").addEventListener("click", () => {
+    if (state.session) attach(state.session, { control: state.control, resume: true });
+    else connectRoom();
   });
   const openFrom = (e) => { const b = e.target.closest("[data-seat]"); if (b) openCard(b.dataset.seat); };
   $("#seats").addEventListener("click", openFrom);
@@ -258,15 +354,14 @@ function bindUI() {
   $("#guideBtn").addEventListener("click", openGuide);
   document.addEventListener("click", async (e) => {
     if (e.target.closest("[data-copy-example]")) {
-      try { await navigator.clipboard.writeText("/roast-room " + EXAMPLE); toast("Copied. Paste it into Claude Code."); }
+      try { await navigator.clipboard.writeText("$roast-room " + EXAMPLE); toast("Copied. Paste it into Codex."); }
       catch { toast("Copy didn't work here. Select the text and copy it."); }
     }
     if (e.target.closest("[data-pdf]")) savePdf(e.target.closest("[data-pdf]"));
   });
   $("#historyBtn").addEventListener("click", openHistory);
-  $("#newBtn").addEventListener("click", reset);
-  $("#verdictSheet").addEventListener("click", (e) => { if (e.target.id === "verdictSheet" || e.target.closest("[data-close]")) $("#verdictSheet").hidden = true; });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("#verdictSheet").hidden = true; });
+  $("#newBtn").addEventListener("click", () => { reset(); connectionNotice(); });
+  $("#verdictSheet").addEventListener("click", (e) => { if (e.target.id === "verdictSheet" || e.target.closest("[data-close]")) $("#verdictSheet").close(); });
   // Clicking the dimmed backdrop around a card, the guide, or past sessions closes it (Escape already does).
   // Both press and release must land outside the box, so a text selection dragged out of it never closes it.
   $$("dialog.card-dialog").forEach((d) => {
@@ -283,6 +378,21 @@ function bindUI() {
     $$(".speed button").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
   }));
   $("#skipBtn").addEventListener("click", () => player.skip());
+}
+
+const sessionPath = (id) => `/api/sessions/${encodeURIComponent(id)}`;
+const sessionAction = (id, action) => `/api/council/${encodeURIComponent(id)}/${action}`;
+
+function fieldError(selector, message = "") {
+  const notice = $(selector);
+  notice.textContent = message;
+  notice.hidden = !message;
+  if (message) notice.scrollIntoView({ block: "nearest" });
+}
+
+function showRunStatus(message = "") {
+  $("#runStatus").textContent = message;
+  $("#runStatus").hidden = !message;
 }
 
 // ------------------------------------------------------------- the player
@@ -305,7 +415,7 @@ const player = {
     if (my === this.epoch) { this.busy = false; this.fast = false; this.info(); }
   },
   sleep(ms) {
-    if (this.fast || ms <= 0) return Promise.resolve();
+    if (this.fast || ms <= 0 || matchMedia("(prefers-reduced-motion: reduce)").matches) return Promise.resolve();
     return new Promise((res) => { const t = setTimeout(() => { this.timers.delete(o); res(); }, ms / this.speed); const o = { t, res }; this.timers.add(o); });
   },
   flushTimers() { for (const o of this.timers) { clearTimeout(o.t); o.res(); } this.timers.clear(); },
@@ -321,74 +431,123 @@ const player = {
 function reset() {
   state.es?.close();
   player.reset();
-  Object.assign(state, { session: null, options: [], weights: {}, active: [], round: 0, cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], speaking: null, setup: null, wait: null });
+  Object.assign(state, { session: null, options: [], weights: {}, active: [], round: 0, cards: { 1: {}, 2: {}, 3: {} }, replaying: false, verdict: null, links: [], speaking: null, setup: null, wait: null,
+    control: false, terminal: false, es: null, cursor: 0, seenEvents: new Set(), decision: null, progress: {} });
+  setSessionUrl();
   hideWait();
+  closeClarification();
+  showRunStatus();
   $("#stage").classList.remove("live");
   $("#topic").hidden = true;
-  $("#composer").hidden = state.runner !== "api";
-  $("#waiting").hidden = state.runner === "api";
+  $("#composer").hidden = state.runner !== "codex";
+  $("#waiting").hidden = state.runner !== "viewer";
+  $("#invite").hidden = state.runner !== "codex";
   $("#caption").hidden = true;
   $("#cruxes").hidden = true;
   $("#plate").hidden = true;
   $("#playbar").hidden = true;
   $("#newBtn").hidden = true;
-  $("#verdictSheet").hidden = true;
-  $("#panelHead").textContent = "Getting started";
+  $("#cancelBtn").hidden = true;
+  $("#verdictSheet").close();
+  $("#panelHead").textContent = state.runner === "codex" ? "New council" : "Getting started";
   $("#feed").innerHTML = GUIDE;
+  $("#feed").hidden = state.runner === "codex";
   $$(".vote").forEach((b) => b.remove());
   renderSeats(state.board);
   $$(".seat").forEach((el) => { el.classList.remove("absent", "speaking", "thinking", "addressed"); $(".bust", el).dataset.shape = "base"; });
   $$(".nameplate").forEach((el) => { el.classList.remove("absent", "speaking"); $(".chip", el).hidden = true; $(".score", el).hidden = true; $(".pips", el).innerHTML = ""; });
   $("#spot").classList.remove("on");
-  $$(".stepper li").forEach((li) => li.classList.remove("active", "done"));
+  $$(".stepper li").forEach((li) => {
+    li.classList.remove("active", "done", "skipped");
+    li.removeAttribute("aria-current");
+    li.removeAttribute("aria-label");
+  });
   drawLinks();
 }
 
 function begin(id) {
   reset();
   state.session = id;
+  setSessionUrl(id);
   $("#composer").hidden = true;
   $("#waiting").hidden = true;
-  $("#newBtn").hidden = false;
+  $("#invite").hidden = true;
   $("#playbar").hidden = false;
+  $("#feed").hidden = false;
   $("#panelHead").textContent = "Key points";
   $("#feed").innerHTML = '<div class="empty">One line per seat as the council talks. Click a seat to read its full card.</div>';
   $("#stage").classList.add("live");
   chairSays("The council is taking their seats", { dots: true });
 }
 
-function attach(id) {
-  begin(id);
-  const es = new EventSource(`/api/stream/${id}`);
+function setSessionUrl(id) {
+  const url = new URL(location.href);
+  if (id) url.searchParams.set("session", id);
+  else url.searchParams.delete("session");
+  history.replaceState(null, "", url);
+}
+
+function attach(id, { control = false, resume = false } = {}) {
+  if (state.session !== id || !resume) begin(id);
+  else state.es?.close();
+  seenLive.add(id);
+  state.control = control;
+  $("#cancelBtn").hidden = !control;
+  connectionNotice();
+  const es = new EventSource(`/api/stream/${encodeURIComponent(id)}`);
   state.es = es;
+  es.onopen = () => { if (state.es === es) connectionNotice(); };
   es.onmessage = (m) => {
+    if (state.es !== es) return;
     const ev = JSON.parse(m.data);
-    if (ev.type === "end") { es.close(); refreshUsage(); return; }
+    if (ev.type === "end") {
+      es.close();
+      connectionNotice();
+      player.push(ev);
+      return;
+    }
+    const cursor = Number(m.lastEventId);
+    if (cursor > 0) {
+      if (cursor <= state.cursor) return;
+      state.cursor = cursor;
+    } else {
+      if (state.seenEvents.has(m.data)) return;
+      state.seenEvents.add(m.data);
+    }
     if (ev.type === "delta") return; // seats speak from their finished cards
-    if (ev.type === "usage") return refreshUsage();
-    if (ev.type === "seat_error") return toast(`${state.byKey[ev.seat].short} hit an error: ${ev.error}`);
+    if (ev.type === "usage") return;
+    if (ev.type === "seat_error") return toast(`${state.byKey[ev.seat]?.short || ev.seat} hit an error: ${ev.error}`);
+    if (ev.type === "status" && ["cancelled", "incomplete"].includes(ev.status)) player.skip();
     player.push(ev);
   };
-  es.onerror = () => { /* the browser retries; the server replays from the start */ };
+  es.onerror = () => {
+    if (state.es !== es) return;
+    const stopped = es.readyState === EventSource.CLOSED;
+    connectionNotice(stopped ? "The stream closed. Reconnect to this session." : "Connection interrupted. Reconnecting to this session…", stopped);
+  };
 }
 
 // ------------------------------------------------------------- event handling
-const STEP_OF = { setup: "setup", round1: "round1", cruxes: "cruxes", round2: "round2", draft: "round3", round3: "round3", skip3: "round3", verdict: "verdict" };
+const STEP_OF = { setup: "setup", round1: "round1", cruxes: "cruxes", round2: "round2", draft: "round3", round3: "round3", skip3: "verdict", verdict: "verdict" };
 const ORDER = ["setup", "round1", "cruxes", "round2", "round3", "verdict"];
 
 function setStep(step) {
   const idx = ORDER.indexOf(step);
   $$(".stepper li").forEach((li) => {
     const i = ORDER.indexOf(li.dataset.step);
-    li.classList.toggle("done", i < idx);
+    li.classList.toggle("done", i < idx && !li.classList.contains("skipped"));
     li.classList.toggle("active", i === idx);
+    if (i === idx) li.setAttribute("aria-current", "step");
+    else li.removeAttribute("aria-current");
   });
 }
 
 async function handle(ev) {
   switch (ev.type) {
     case "phase": {
+      closeClarification();
       state.wait = { phase: ev.phase, at: ev.at || Date.now() };
+      if (ev.phase === "skip3") markVoteSkipped();
       setStep(STEP_OF[ev.phase] || "setup");
       feedPhase(ev.label);
       const thinking = ["setup", "cruxes", "draft", "verdict"].includes(ev.phase);
@@ -399,19 +558,79 @@ async function handle(ev) {
       break;
     }
     case "setup": state.setup = ev; await onSetup(ev); await player.sleep(1800); break;
+    case "clarification": if (!state.replaying) openClarification(ev.questions); break;
+    case "clarification_answered":
+      closeClarification();
+      showRunStatus(ev.timedOut ? "The Chair will continue with the available details." : "");
+      break;
     case "round_start": onRoundStart(ev.round); break;
+    case "round_progress": {
+      state.progress[ev.round] = ev.complete;
+      showRunStatus(`Round ${ev.round} · ${ev.complete} of ${ev.total} advisor cards ready`);
+      break;
+    }
     case "seat_start": $(`#seat-${ev.seat}`)?.classList.add("thinking"); break;
     case "seat_done": await onSeatDone(ev); break;
-    case "round_done": state.wait = null; updateOptions(ev.scores); break;
+    case "round_done": {
+      state.wait = null;
+      if (ev.cards) for (const card of ev.cards) await onSeatDone(card);
+      updateOptions(ev.scores, ev.recommended);
+      showRunStatus();
+      break;
+    }
     case "cruxes": await onCruxes(ev); break;
     case "draft": await onDraft(ev.draft); break;
-    case "verdict": state.wait = null; onVerdict(ev); break;
-    case "error": state.wait = null; toast(`The council stopped: ${ev.error}`); chairSays(`The council stopped: ${ev.error}`); break;
+    case "verdict":
+      state.wait = null;
+      if (ev.decision) onCodexVerdict(ev);
+      else onVerdict(ev);
+      break;
+    case "status":
+      if (["done", "incomplete", "cancelled", "interrupted", "stopped"].includes(ev.status)) finishView(ev.status, ev.message);
+      break;
+    case "end": if (!state.terminal) finishView(state.verdict ? "done" : "stopped"); break;
+    case "error": finishView("incomplete", ev.error); break;
   }
 }
 
+function openClarification(questions) {
+  state.wait = null;
+  $("#questions").innerHTML = questions.map((question) => `<li>${esc(question)}</li>`).join("");
+  showRunStatus(state.control ? "The council is waiting for your answer." : "The Chair is waiting for an answer in Codex.");
+  if (state.control && !state.terminal) {
+    $("#clarification").hidden = false;
+    $("#answer").focus({ preventScroll: true });
+  }
+  chairSays("The Chair needs more information to seat the council.", { tag: "Clarification" });
+}
+
+function closeClarification() {
+  $("#clarification").hidden = true;
+  $("#answer").value = "";
+  fieldError("#clarificationError");
+}
+
+function finishView(status, detail = "") {
+  state.wait = null;
+  state.terminal = true;
+  state.control = false;
+  closeClarification();
+  $("#cancelBtn").hidden = true;
+  $("#newBtn").hidden = false;
+  $("#playbar").hidden = true;
+  if (status === "done") return showRunStatus();
+  $("#stage").classList.remove("live");
+  setSpeaker(null);
+  $$(".seat.thinking").forEach((seat) => seat.classList.remove("thinking"));
+  const message = status === "cancelled" ? "Council cancelled." : "Council incomplete.";
+  showRunStatus(detail.startsWith(message) ? detail : `${message} ${detail || "Completed rounds are still available."}`);
+  chairSays(message, { tag: status === "cancelled" ? "Cancelled" : "Incomplete" });
+}
+
 async function onSetup(ev) {
-  if (ev.seats.some((k) => !state.byKey[k])) await refreshSeats(); // a seat added since the page loaded
+  const epoch = player.epoch;
+  if (ev.seats.some((k) => !state.byKey[k])) await refreshSeats().catch(() => null);
+  if (epoch !== player.epoch) return;
   // seat the default board plus anyone this council called in; past the table's limit, only this council
   const both = [...new Set([...state.board, ...ev.seats])];
   renderSeats(both.length <= MAX_TABLE ? both : ev.seats);
@@ -422,7 +641,7 @@ async function onSetup(ev) {
   $("#topicTitle").textContent = ev.title;
   typeIn($("#topicTitle"));
   $("#options").innerHTML = ev.options.map((o) => `
-    <div class="opt" data-opt="${o.id}"><span class="id">${o.id}</span><span class="label">${esc(o.label)}</span><span class="val">-</span><span class="bar"><i></i></span></div>`).join("");
+    <div class="opt" data-opt="${esc(o.id)}"><span class="id">${esc(o.id)}</span><span class="label">${esc(o.label)}</span><span class="val">–</span><span class="bar"><i></i></span></div>`).join("");
   for (const s of state.table.map((k) => state.byKey[k])) {
     const absent = !ev.seats.includes(s.key);
     $(`#seat-${s.key}`).classList.toggle("absent", absent);
@@ -434,11 +653,14 @@ async function onSetup(ev) {
   chairSays(ev.title, { tag: ev.mode === "quick" ? "Quick council" : "Full council" });
 }
 
-function updateOptions(scores) {
-  const best = Object.entries(scores).sort((a, b) => (b[1].score ?? 0) - (a[1].score ?? 0))[0]?.[0];
+function updateOptions(scores, recommended) {
+  const best = recommended || Object.entries(scores).sort((a, b) =>
+    (b[1].raw ?? b[1].score ?? 0) - (a[1].raw ?? a[1].score ?? 0)
+      || Number(state.options.find((option) => option.id === b[0])?.statusQuo || false)
+        - Number(state.options.find((option) => option.id === a[0])?.statusQuo || false))[0]?.[0];
   for (const [id, v] of Object.entries(scores)) {
-    const el = $(`.opt[data-opt="${id}"]`); if (!el) continue;
-    $(".val", el).textContent = v.score ?? "-";
+    const el = $(`#options .opt[data-opt="${CSS.escape(id)}"]`); if (!el) continue;
+    $(".val", el).textContent = v.display ?? v.score ?? "–";
     $(".bar i", el).style.width = `${(v.score || 0) * 10}%`;
     el.classList.toggle("lead", id === best);
     el.title = v.math;
@@ -524,6 +746,7 @@ function chairSays(text, { dots = false, tag = "" } = {}) {
 }
 
 async function speak(key, text, { tag = "", target = null, sub = "" } = {}) {
+  const epoch = player.epoch;
   setSpeaker(key, target);
   captionFor(key);
   $("#capTag").textContent = tag;
@@ -534,19 +757,25 @@ async function speak(key, text, { tag = "", target = null, sub = "" } = {}) {
   p.innerHTML = words.map((w) => `<span class="w">${esc(w)}</span> `).join("");
   const spans = $$(".w", p);
   for (let i = 0; i < words.length; i++) {
-    if (player.fast) break;
+    if (player.fast || matchMedia("(prefers-reduced-motion: reduce)").matches) break;
     const w = words[i];
     spans[i].classList.add("on");
     const shapes = shapesFor(w.replace(/[^a-z]/gi, ""));
     const dur = Math.max(170, w.length * 52);
     const per = dur / (shapes.length + 1);
-    for (const sh of shapes) { setShape(key, sh); await player.sleep(per); }
+    for (const sh of shapes) {
+      if (epoch !== player.epoch) return;
+      setShape(key, sh);
+      await player.sleep(per);
+    }
+    if (epoch !== player.epoch) return;
     setShape(key, "base");
     await player.sleep(per + (/[.!?]["”)]?$/.test(w) ? 340 : /[,;:]$/.test(w) ? 170 : 25));
   }
+  if (epoch !== player.epoch) return;
   spans.forEach((s) => s.classList.add("on"));
   setShape(key, "base");
-  $("#capSub").innerHTML = sub;
+  $("#capSub").textContent = sub;
   await player.sleep(1300);
 }
 
@@ -565,9 +794,10 @@ function startBlinking() {
 }
 
 async function onSeatDone(ev) {
-  const { round, seat, text, parsed, quotes } = ev;
-  state.cards[round][seat] = { text, parsed, quotes };
-  const s = state.byKey[seat];
+  const { round, seat, parsed } = ev;
+  const epoch = player.epoch;
+  if (!state.cards[round] || !state.byKey[seat]) return;
+  state.cards[round][seat] = ev;
   const top = topOption(parsed.optionScores);
   const line = lineFor(round, parsed);
   let tag = ROUND_NAME[round], sub = "", target = null;
@@ -584,19 +814,18 @@ async function onSeatDone(ev) {
     }
     sub = /^yes/i.test(parsed.moved) ? "Changed position" : "";
   } else {
-    const v = parsed.vote || "endorse";
-    tag = `Votes ${v}`;
-
+    tag = parsed.vote ? `Votes ${parsed.vote}` : "Vote missing";
   }
   feedCard(round, seat, parsed);
   await speak(seat, line || "I'll put it in my card.", { tag, target, sub });
 
+  if (epoch !== player.epoch) return;
   const pl = $(`#plate-${seat}`);
   const chip = $(".chip", pl);
   chip.hidden = round === 3; // the vote stamp says it
   chip.className = "chip";
-  if (round === 3) {
-    const v = parsed.vote || "endorse";
+  if (round === 3 && ["endorse", "amend", "dissent"].includes(parsed.vote)) {
+    const v = parsed.vote;
     chip.textContent = v;
     chip.classList.add(v);
     $(`#seat-${seat} .vote`)?.remove();
@@ -607,7 +836,6 @@ async function onSeatDone(ev) {
   } else chip.textContent = stanceWord(parsed.stance);
   if (top) { const sc = $(".score", pl); sc.hidden = false; sc.textContent = `${top.id} ${top.v}`; sc.title = `Highest score: option ${top.id}`; }
   setSpeaker(null);
-  void s;
 }
 
 function stanceWord(t = "") {
@@ -686,8 +914,15 @@ function feedCard(round, seat, parsed) {
   d.dataset.round = round;
   const top = topOption(parsed.optionScores);
   const tgt = parsed.disagreeWith ? state.byKey[parsed.disagreeWith]?.short : "";
-  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : `Votes ${parsed.vote || "endorse"}`;
+  const what = round === 1 ? `${stanceWord(parsed.stance)}${top ? `, backs ${top.id}` : ""}` : round === 2 ? (tgt ? `vs ${tgt}` : "Debate") : parsed.vote ? `Votes ${parsed.vote}` : "Vote missing";
   d.innerHTML = `<img class="av" src="${portrait(seat)}" alt=""><div><div class="h">${esc(s.short)}<span class="r">${esc(what)}</span></div><p>${esc(lineFor(round, parsed, 105))}</p></div>`;
+  d.tabIndex = 0;
+  d.setAttribute("role", "button");
+  d.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    openCard(seat, round);
+  });
   feedAppend(d);
 }
 
@@ -696,11 +931,15 @@ function openCard(seat, round) {
   const rounds = [3, 2, 1].filter((r) => state.cards[r][seat]);
   const r = round || rounds[0];
   const c = state.cards[r]?.[seat];
+  const packet = state.decision?.evidence?.[seat] || c?.evidence;
+  const profile = state.decision?.profiles?.[seat] || { name: s.name, version: state.setup?.profileVersions?.[seat] };
+  const sources = buildSeatEvidence(seat, packet, profile, c?.card ? evidenceReferences(c.card) : undefined, c?.card?.frameworksUsed, c?.card?.quotes);
   $("#cardBody").innerHTML = `
-    <div class="card-head"><img src="${portrait(seat)}" alt=""><div><div class="label">${esc(s.pillar)}</div><h3>${esc(s.name)}</h3><p class="muted" style="margin:0">Owns the question: ${esc(s.question)}</p></div></div>
+    <div class="card-head"><img src="${portrait(seat)}" alt=""><div><div class="label">${esc(s.pillar)}</div><h3 id="seatHeading">${esc(s.name)}</h3><p class="muted" style="margin:0">Owns the question: ${esc(s.question)}</p></div></div>
     ${rounds.length > 1 ? `<p style="margin:0 0 6px">${rounds.slice().reverse().map((x) => `<button class="ghost" data-r="${x}" style="margin-right:6px">${ROUND_NAME[x]}</button>`).join("")}</p>` : ""}
-    ${c ? `<pre>${esc(c.text)}</pre>${c.quotes.length ? `<ul class="qcheck">${c.quotes.map((q) => `<li class="${q.verified ? "" : "bad"}">"${esc(shorten(q.quote, 110))}" (${q.source}) ${q.verified ? "verified in the brain" : "not found in the brain"}</li>`).join("")}</ul>` : ""}` : `<p class="muted">This seat has not spoken yet.</p>`}
-    <p class="muted" style="font-size:12px">A simulated advisor built from ${esc(s.name)}'s public work. Not the person.</p>`;
+    ${c ? `<pre>${esc(c.text)}</pre>${c.quotes?.length ? `<ul class="qcheck">${c.quotes.map((q) => `<li class="${q.verified ? "" : "bad"}">"${esc(shorten(q.quote, 110))}" (${esc(q.source)}) ${q.verified ? "verified in the brain" : "not found in the brain"}</li>`).join("")}</ul>` : ""}` : `<p class="muted">This seat has not spoken yet.</p>`}
+    ${renderSeatSources(sources, c?.card?.claims)}
+    <p class="muted" style="font-size:12px">A simulated advisor inspired by ${esc(s.name)}'s public work.</p>`;
   $$("#cardBody [data-r]").forEach((b) => b.addEventListener("click", () => openCard(seat, Number(b.dataset.r))));
   const dlg = $("#cardDialog");
   if (!dlg.open) dlg.showModal();
@@ -713,8 +952,7 @@ const seatName = (x) => state.byKey[seatKey(x)]?.short || x;
 
 function labelClass(l) { return /DON'T/.test(l) ? "dont" : /RESHAPE/.test(l) ? "reshape" : /WAIT/.test(l) ? "wait" : "go"; }
 
-function onVerdict(ev) {
-  const v = ev.verdict;
+function resetStageForVerdict(ev, scores, recommended) {
   state.verdict = ev;
   setStep("verdict");
   setSpeaker(null);
@@ -723,14 +961,32 @@ function onVerdict(ev) {
   state.links = [];
   drawLinks();
   $("#stage").classList.remove("live");
-  updateOptions(v.scores);
-  const opt = (id) => state.options.find((o) => o.id === id)?.label || id;
+  updateOptions(scores, recommended);
+  finishView("done");
+}
+
+function showVerdictSheet() {
+  const dialog = $("#verdictSheet");
+  if (!dialog.open) dialog.showModal();
+  dialog.scrollTop = 0;
+  $("#verdictHeading").focus({ preventScroll: true });
+}
+
+function markVoteSkipped() {
+  const step = $(".stepper [data-step=round3]");
+  step.classList.add("skipped");
+  step.setAttribute("aria-label", "Vote skipped");
+}
+
+function onVerdict(ev) {
+  const v = ev.verdict;
+  resetStageForVerdict(ev, v.scores, v.recommended);
   const seats = ev.seats;
   const mk = seatKey(v.minority.seat);
   const short = (t, n) => esc(shorten(clean(t || ""), n));
   const html = `
     <div class="v-top">
-      <div><div class="label">The council's verdict</div><span class="v-label ${labelClass(v.label)}">${esc(v.label)}</span></div>
+      <div><h2 class="label" id="verdictHeading" tabindex="-1">The council's verdict</h2><span class="v-label ${labelClass(v.label)}">${esc(v.label)}</span></div>
       <div class="actions"><button class="pill" type="button" data-pdf>Download PDF</button><button class="ghost" data-close>Back to the table</button></div>
     </div>
     <p class="v-call">${esc(v.call)}</p>
@@ -763,47 +1019,161 @@ function onVerdict(ev) {
   const plate = $("#plate");
   plate.hidden = false;
   plate.innerHTML = `<div class="label">The council's verdict</div><span class="v-label ${labelClass(v.label)}">${esc(v.label)}</span><p>${esc(firstSentences(clean(v.call), 150))}</p><div class="row"><button type="button" id="plateOpen">Read the verdict</button><button type="button" data-pdf>Download PDF</button><button type="button" class="alt" id="plateReplay">Replay this council</button></div>`;
-  $("#plateOpen").addEventListener("click", () => ($("#verdictSheet").hidden = false));
+  $("#plateOpen").addEventListener("click", showVerdictSheet);
   $("#plateReplay").addEventListener("click", () => replay(state.session));
   $("#playbar").hidden = true;
   const f = document.createElement("div");
   f.className = "feed-note";
   f.innerHTML = `<b>Verdict: ${esc(v.label)}.</b> ${esc(firstSentences(clean(v.call), 160))}`;
   feedAppend(f);
-  setTimeout(() => { if (state.verdict === ev) $("#verdictSheet").hidden = false; }, 1600);
+  setTimeout(() => { if (state.verdict === ev) showVerdictSheet(); }, 1600);
+}
+
+function onCodexVerdict(ev) {
+  const decision = ev.decision;
+  state.decision = decision;
+  const report = buildDecisionReport(decision);
+  if (decision.ratificationStatus === "not_run") markVoteSkipped();
+  resetStageForVerdict(ev, decision.scores, report.recommended);
+  const verdict = `<span class="v-label ${labelClass(report.label)}">${esc(report.label)}</span>`;
+  const list = (items) => items.map((item) => `<li>${esc(item)}</li>`).join("");
+  const sourceDrawers = report.evidence.map((evidence) => `<h4>${esc(evidence.name)}</h4>${renderSeatSources(evidence)}`).join("");
+  const scoreRows = report.scores.map((option) => `
+    <div class="opt ${option.recommended ? "lead" : ""}" data-result-option="${esc(option.id)}" title="${esc(option.math)}">
+      <span class="id">${esc(option.id)}</span><span class="label">${esc(option.label)}${option.recommended ? " · Recommended" : ""}</span>
+      <span class="val">${esc(option.display)}</span><span class="bar" aria-hidden="true"><i style="width:${option.score * 10}%"></i></span>
+    </div>`).join("");
+  const conditions = [
+    ...report.overrides.map(({ message }) => message), ...report.conditions,
+    ...report.mitigations.map(({ option, description }) => `Option ${option} · ${description}`),
+    ...(report.prerequisite ? [`${report.prerequisite.trigger} · Due ${report.prerequisite.deadline} · If unmet, ${report.prerequisite.failure}`] : []),
+  ];
+  const actions = [
+    ...report.actions.map(({ when, action }) => [when, action].filter(Boolean).join(" · ")),
+    ...report.pillars.filter(({ repair }) => repair).map(({ name, score, repair }) => `${name} · Pillar ${score}/10 · ${repair}`),
+    ...report.stopConditions.map((condition) => `Stop if ${condition}`),
+    ...(report.reviewDate ? [`Review · ${report.reviewDate}`] : []),
+  ];
+  const test = report.cheapestTest;
+  const dissent = report.dissent;
+  $("#verdictBody").innerHTML = `
+    <div class="v-top">
+      <div><h2 class="label" id="verdictHeading" tabindex="-1">The council's verdict</h2>${verdict}</div>
+      <div class="verdict-actions">
+        <button class="ghost" type="button" data-pdf>Download PDF</button>
+        <a class="ghost" href="${sessionPath(state.session)}/report.md" download>Download Markdown</a>
+        <button class="ghost" type="button" data-close>Back to the table</button>
+      </div>
+    </div>
+    <p class="recommended-option"><small class="label">Recommended option ${esc(report.recommended)}</small>${esc(report.optionLabel)}</p>
+    <p class="v-call">${esc(report.recommendation)}</p>
+    <div class="v-stats">
+      <span data-ratification>${esc(report.ratification)}</span><span>Score band ${esc(report.scoreBand)}</span>
+      <span>Confidence ${esc(report.confidence)}/10</span><span>Spread ${esc(report.spread)}</span>
+      ${report.support != null ? `<span>Draft support ${esc(report.support)}/10</span>` : ""}
+    </div>
+    <div class="v-grid priority-grid">
+      <section class="v-sec"><h3>${dissent?.caveat ? "Strongest caveat" : "Strongest dissent"}</h3>
+        ${dissent ? `<p><b>${esc(dissent.name)}</b></p><p data-dissent>${esc(dissent.statement)}</p><p class="muted">What would change the assessment · ${esc(dissent.whatWouldChange)}</p>`
+      : "<p>The council recorded no unresolved dissent.</p>"}
+      </section>
+      <section class="v-sec"><h3>Cheapest experiment</h3>
+        ${test ? `<p data-experiment>${esc(test.action)}</p><p class="muted">Cost · ${esc(test.cost)}</p><p>Success threshold · ${esc(test.success)}</p>` : ""}
+        ${report.cheapTestRequired ? "<p><b>Required before proceeding.</b></p>" : ""}
+      </section>
+    </div>
+    <section class="v-sec decision-scores"><h3>Weighted option scores</h3><div class="v-opts">${scoreRows}</div></section>
+    ${conditions.length ? `<section class="v-sec decision-conditions"><h3>Verdict conditions</h3><ul>${list(conditions)}</ul></section>` : ""}
+    <div class="decision-details">
+      ${report.reasons.length || report.cruxes.length ? `<details class="result-detail"><summary>Reasons and disagreements</summary>
+        <div class="v-sec"><ul>${list([...report.reasons.map(({ name, point }) => `${name ? `${name} · ` : ""}${point}`), ...report.cruxes.map(({ question }) => question)])}</ul></div></details>` : ""}
+      ${actions.length ? `<details class="result-detail"><summary>Actions and review</summary><div class="v-sec"><ul>${list(actions)}</ul></div></details>` : ""}
+      <details class="result-detail"><summary>Advisor scorecard</summary>
+        <div class="scorecard-scroll"><table class="scorecard"><thead><tr><th>Advisor</th><th>Weight</th>
+          ${report.scores.map(({ id }) => `<th>${esc(id)}</th>`).join("")}${report.votes ? "<th>Vote</th>" : ""}
+        </tr></thead><tbody>${report.scorecard.map((row) => `<tr><td>${esc(row.name)}</td><td title="${esc(row.reason)}">${esc(row.weight)}</td>
+          ${row.scores.map((score) => `<td>${esc(score ?? "–")}</td>`).join("")}${report.votes ? `<td>${esc(row.vote)}</td>` : ""}</tr>`).join("")}</tbody></table>
+        <ul class="source-gaps">${list(report.scores.map(({ id, math }) => `${id} · ${math}`))}</ul></div>
+      </details>
+      <details class="result-detail"><summary>Evidence appendix</summary><div>${sourceDrawers}</div></details>
+      <details class="result-detail"><summary>Session record</summary><div class="v-sec">
+        ${report.brief ? `<p>${esc(report.brief)}</p>` : ""}
+        ${report.context ? `<p>${esc(report.context)}</p>` : ""}
+        ${report.clarifications?.answer ? `<p><b>Clarification</b> · ${esc(report.clarifications.answer)}</p>` : ""}
+        <ul>${list([...report.assumptions, ...report.versions.map(([key, value]) => `${key} · ${value}`),
+        ...(report.draftHash ? [`Draft · ${report.draftHash}`] : []),
+        ...(report.votedHash ? [`Voted draft · ${report.votedHash}`] : [])])}</ul>
+      </div></details>
+    </div>`;
+  const plate = $("#plate");
+  plate.hidden = false;
+  plate.innerHTML = `<div class="label">Recommended option ${esc(report.recommended)}</div>${verdict}
+    <p>${esc(report.optionLabel)}</p><div class="row">
+      <button type="button" id="plateOpen">Read the verdict</button>
+      <button type="button" class="alt" id="plateReplay">Replay this council</button>
+    </div>`;
+  $("#plateOpen").addEventListener("click", showVerdictSheet);
+  $("#plateReplay").addEventListener("click", () => replay(state.session));
+  const note = document.createElement("div");
+  note.className = "feed-note";
+  note.textContent = `${report.label} · ${report.optionLabel}`;
+  feedAppend(note);
+  showVerdictSheet();
 }
 
 // ------------------------------------------------------------- history + replay
 async function openHistory() {
-  const { sessions } = await fetch("/api/sessions").then((x) => x.json());
-  $("#historyList").innerHTML = sessions.length
-    ? sessions.map((s) => `<li><button data-id="${esc(s.id)}"><b>${esc(s.title)}</b><small>${esc(s.id.slice(0, 10))} · ${esc(s.mode)} · ${esc(s.status)}</small></button>${s.status === "done" ? `<button class="pdf" type="button" data-pdf="${esc(s.id)}" title="Download the verdict as a PDF">PDF</button>` : ""}</li>`).join("")
-    : '<li class="muted">No sessions yet. Convene the council once and it shows up here.</li>';
-  $$("#historyList button[data-id]").forEach((b) => b.addEventListener("click", () => { $("#historyDialog").close(); replay(b.dataset.id); }));
-  $("#historyDialog").showModal();
-}
-
-async function replay(id) {
-  const j = await fetch(`/api/sessions/${encodeURIComponent(id)}`).then((x) => x.json());
-  begin(id);
-  state.replaying = true;
-  for (const ev of j.events) {
-    if (["delta", "usage", "seat_error", "end"].includes(ev.type)) continue;
-    player.push(ev);
+  const dialog = $("#historyDialog");
+  const list = $("#historyList");
+  list.innerHTML = '<li class="muted" role="status">Loading sessions…</li>';
+  if (!dialog.open) dialog.showModal();
+  try {
+    const { sessions } = await requestJson("/api/sessions");
+    list.innerHTML = sessions.length
+      ? sessions.map((s) => `<li><button type="button" data-id="${esc(s.id)}"><b>${esc(s.title)}</b><small>${esc(s.id.slice(0, 10))} · ${esc(s.mode)} · ${esc(s.status)}</small></button>${s.status === "done" ? `<button class="pdf" type="button" data-pdf="${esc(s.id)}" aria-label="Download PDF for ${esc(s.title)}">PDF</button>` : ""}</li>`).join("")
+      : '<li class="muted">No sessions yet. Start a council in the room or in Codex.</li>';
+    $("button[data-id]", list)?.focus({ preventScroll: true });
+    $$("button[data-id]", list).forEach((b) => b.addEventListener("click", () => { dialog.close(); replay(b.dataset.id); }));
+  } catch {
+    list.innerHTML = '<li class="muted">The room couldn’t load past sessions. <button type="button" data-retry-history>Try again</button></li>';
+    $("[data-retry-history]", list).addEventListener("click", openHistory);
   }
 }
 
-// ------------------------------------------------------------- waiting on Claude Code
+async function replay(id) {
+  let session;
+  try { session = await requestJson(sessionPath(id)); }
+  catch (error) { return toast(error.message); }
+  if (["running", "clarifying"].includes(session.status)) {
+    attach(id, { control: ["browser", "codex", "demo"].includes(session.source) });
+    return;
+  }
+  begin(id);
+  state.replaying = true;
+  const events = session.events.filter((event) => !["delta", "usage", "seat_error", "end"].includes(event.type));
+  const verdict = events.findLastIndex((event) => event.type === "verdict");
+  if (session.decision) {
+    const final = { type: "verdict", decision: session.decision };
+    if (verdict === -1) events.push(final);
+    else events[verdict] = final;
+  }
+  if (!events.some((event) => event.type === "status" && event.status === session.status)) {
+    events.push({ type: "status", status: session.status });
+  }
+  for (const event of events) player.push(event);
+  player.push({ type: "end" });
+}
+
+// ------------------------------------------------------------- waiting on Codex
 // A live council goes quiet for minutes while the seats write in parallel. Instead of a
 // frozen table, say what is happening, how long it has been, and what each seat is weighing.
-const SAME_TIME = "The advisors all write at the same time in Claude Code. Their lines play here as soon as the round is in.";
+const SAME_TIME = "Cards appear together when every advisor has finished the round.";
 function waitCopy(phase) {
-  const n = state.setup?.mode === "quick" ? 2 : 3;
   return {
     setup: ["Setting the table", "The Chair is seating the council.", ""],
-    round1: ["Round 1 of " + n, "The advisors are writing their opening positions.", SAME_TIME],
-    round2: ["Round 2 of " + n, "The advisors are reading each other's openings and firing back.", SAME_TIME],
-    round3: ["Round 3 of " + n, "The advisors are voting on the Chair's proposal.", SAME_TIME],
+    round1: ["Round 1 · Openings", "The advisors are writing their opening positions.", SAME_TIME],
+    round2: ["Round 2 · Debate", "The advisors are reading each other's openings and firing back.", SAME_TIME],
+    round3: ["Round 3 · Vote", "The advisors are voting on the Chair's proposal.", SAME_TIME],
     cruxes: ["Between rounds", "The Chair is reading the openings and finding where they disagree.", "The fight shows up here next, then the debate starts."],
     draft: ["Between rounds", "The Chair is turning the debate into a proposal for the vote.", "Next, every advisor votes on it."],
     skip3: ["Last step", "The Chair is scoring the room and writing the verdict.", "When it lands, you can download it as a PDF."],
@@ -848,7 +1218,7 @@ function tickWait() {
   const muse = $("#wcMuse");
   if (round) {
     const seats = state.active.length ? state.active : state.table;
-    const done = seats.filter((k) => state.cards[round][k]).length;
+    const done = state.progress[round] ?? seats.filter((k) => state.cards[round][k]).length;
     bar.classList.toggle("indeterminate", done === 0);
     $("#wcBar").style.width = done ? Math.round((done / seats.length) * 100) + "%" : "";
     // every few seconds, show what one of the still-thinking seats is weighing
@@ -859,7 +1229,8 @@ function tickWait() {
       const s = state.byKey[pending[state.museIdx]];
       muse.classList.add("fade");
       setTimeout(() => {
-        muse.innerHTML = "<b>" + esc(s.short) + "</b> is weighing: " + esc(s.question.replace(/^./, (c) => c.toLowerCase())) + (done ? " · " + done + " of " + seats.length + " in" : "");
+        if (state.wait !== w) return;
+        muse.innerHTML = "<b>" + esc(s.short) + "</b> is weighing " + esc(s.question.replace(/^./, (c) => c.toLowerCase())) + (done ? " · " + done + " of " + seats.length + " ready" : "");
         muse.classList.remove("fade");
         $$(".seat").forEach((el) => el.classList.toggle("musing", el.dataset.seat === s.key));
       }, 300);
@@ -874,25 +1245,24 @@ function tickWait() {
 
 function openGuide() {
   $("#guideBody").innerHTML = GUIDE;
+  $("h4", $("#guideBody")).id = "guideHeading";
   const d = $("#guideDialog");
   if (!d.open) d.showModal();
 }
 
 // ------------------------------------------------------------- PDF
 async function savePdf(btn) {
-  const id = btn.dataset.pdf;
+  const id = btn.dataset.pdf || state.session;
   btn.disabled = true;
   const old = btn.textContent;
   btn.textContent = "Making PDF...";
   try {
-    let setup = state.setup, verdict = state.verdict;
-    if (id) { // a past session from the history list
-      const j = await fetch("/api/sessions/" + encodeURIComponent(id)).then((x) => x.json());
-      setup = j.events.find((e) => e.type === "setup");
-      verdict = [...j.events].reverse().find((e) => e.type === "verdict");
-    }
+    const session = await requestJson(sessionPath(id));
+    if (session.decision) return await downloadDecisionPdf({ decision: session.decision });
+    const setup = session.events.find((event) => event.type === "setup");
+    const verdict = session.events.findLast((event) => event.type === "verdict");
     if (!setup || !verdict) throw new Error("This council has no verdict yet.");
-    await downloadVerdictPdf({ setup, verdict, byKey: state.byKey, id: id || state.session });
+    await downloadVerdictPdf({ setup, verdict, byKey: state.byKey, id });
   } catch (e) {
     console.error(e);
     toast("Couldn't make the PDF: " + (e.message || e));
@@ -911,11 +1281,4 @@ function toast(msg) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => (t.hidden = true), 6000);
 }
-async function refreshUsage() {
-  const u = await fetch("/api/usage").then((x) => x.json()).catch(() => null);
-  if (!u || !u.calls) { $("#usage").textContent = ""; return; }
-  const k = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1000)}k`);
-  $("#usage").textContent = `${u.calls} calls · ${k(u.input + u.cacheRead + u.cacheWrite)} in · ${k(u.output)} out`;
-}
-
 boot();
